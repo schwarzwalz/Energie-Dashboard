@@ -90,7 +90,6 @@ h1{font-size:1.3rem;margin-bottom:2px}
     </div>
     <p class="sub">schwarzwalz/Energie-Dashboard &bull; Daten werden in GitHub gespeichert</p>
 
-
 <div id="status-bar" class="status"></div>
 
 <div class="meter-tabs">
@@ -102,19 +101,17 @@ h1{font-size:1.3rem;margin-bottom:2px}
 <div class="kpis" id="kpis"></div>
 
 <div class="tabs">
-  <button class="tab active" id="tab-monthly" onclick="showView('monthly')">Monatlich</button>
-  <button class="tab" id="tab-seasonal" onclick="showView('seasonal')">Saisonal</button>
+  <button class="tab active" id="tab-seasonal" onclick="showView('seasonal')">Saisonal</button>
   <button class="tab" id="tab-yearly" onclick="showView('yearly')">J&#228;hrlich</button>
   <button class="tab" id="tab-forecast" onclick="showView('forecast')">Prognose</button>
   <button class="tab" id="tab-table" onclick="showView('table')">Datentabelle</button>
 </div>
 
 <div class="card">
-  <h3 id="chart-title">Monatlicher Verbrauch</h3>
+  <h3 id="chart-title">Saisonaler Vergleich</h3>
   <div id="chart-area"></div>
 </div>
 <p class="note" id="footer-note"></p>
-
 
   </div>
 </div>
@@ -180,7 +177,7 @@ var METERS = {
 
 var DATA = {gas:[], strom:[], wasser:[]};
 var currentMeter = "gas";
-var currentView  = "monthly";
+var currentView  = "seasonal";
 var fileSHA = "";
 
 // ---- Token ----
@@ -214,7 +211,6 @@ function loadData(){
     .then(function(text){
       if(text===null||text===undefined) return;
       if(!text||text.trim()===""){setStatus("err","data.json ist leer");return;}
-      // Strip any BOM, HTML wrapper or invisible chars
       text=text.trim();
       var start=text.indexOf("{");
       var end=text.lastIndexOf("}");
@@ -261,7 +257,6 @@ function findBadChar(text){
 
 function saveData(cb){
   setStatus("loading","Wird in GitHub gespeichert...");
-  // If we don't have SHA yet, fetch it first
   if(!fileSHA){
     fetch(API+"?ref="+BRANCH,{headers:ghHeaders()})
       .then(function(r){ return r.ok?r.json():null; })
@@ -402,7 +397,9 @@ function getYearly(monthly){
 
 // ---- Forecast ----
 function computeForecast(monthly,yearly){
-  var cur=new Date().getFullYear();
+  var now=new Date();
+  var cur=now.getFullYear();
+  var curMonth=now.getMonth()+1; // 1-12, current month (may be partial)
   var comp=yearly.filter(function(y){return y.year<cur&&y.value>0;}).slice(-5);
   if(!comp.length) return null;
   var totalW=0,wAnn=0,wShare=[0,0,0,0,0,0,0,0,0,0,0,0];
@@ -415,20 +412,56 @@ function computeForecast(monthly,yearly){
   var avgAnn=wAnn/totalW, sSum=0;
   wShare=wShare.map(function(s){var v=s/totalW;sSum+=v;return v;});
   wShare=wShare.map(function(s){return sSum>0?s/sSum:1/12;});
+
+  // Find actual data for current year
   var actMap={},lastMo=0;
   monthly.filter(function(m){return m.year===cur;}).forEach(function(m){
     actMap[m.month]=m.value; if(m.month>lastMo) lastMo=m.month;
   });
+
+  // Calculate how far through the current month we are (for partial month extrapolation)
+  var daysInCurMonth=new Date(cur,curMonth,0).getDate();
+  var dayOfMonth=now.getDate();
+  var monthFraction=dayOfMonth/daysInCurMonth;
+
   var actTotal=0;
   for(var mo=1;mo<=lastMo;mo++) actTotal+=(actMap[mo]||0);
-  var proj=actTotal;
+
+  // If current month has actual data (lastMo === curMonth), extrapolate it to full month
+  var actTotalForProj=actTotal;
+  if(lastMo===curMonth && actMap[curMonth] && monthFraction>0 && monthFraction<1){
+    // Replace partial month value with extrapolated full month value
+    var partialVal=actMap[curMonth];
+    var extrapolatedVal=partialVal/monthFraction;
+    actTotalForProj=actTotal-partialVal+extrapolatedVal;
+  }
+
+  // Project remaining months after lastMo
+  var proj=actTotalForProj;
   for(var pm=lastMo+1;pm<=12;pm++) proj+=avgAnn*wShare[pm-1];
+
   var months=[];
   for(var fm=0;fm<12;fm++){
     var mo2=fm+1,isAct=mo2<=lastMo;
-    months.push({month:MONTHS[fm],value:isAct?(actMap[mo2]||0):Math.round(avgAnn*wShare[fm]*10)/10,isActual:isAct});
+    var isPartial=(mo2===curMonth&&mo2===lastMo&&monthFraction<1);
+    var dispVal;
+    if(isAct){
+      dispVal=actMap[mo2]||0;
+    } else {
+      dispVal=Math.round(avgAnn*wShare[fm]*10)/10;
+    }
+    months.push({month:MONTHS[fm],value:dispVal,isActual:isAct,isPartial:isPartial});
   }
-  return {months:months,projected:Math.round(proj),actualSoFar:Math.round(actTotal),avgAnnual:Math.round(avgAnn),lastActualMonth:lastMo,refYears:comp.map(function(y){return y.year;})};
+  return {
+    months:months,
+    projected:Math.round(proj),
+    actualSoFar:Math.round(actTotal),
+    avgAnnual:Math.round(avgAnn),
+    lastActualMonth:lastMo,
+    currentMonth:curMonth,
+    monthFraction:monthFraction,
+    refYears:comp.map(function(y){return y.year;})
+  };
 }
 
 // ---- Render ----
@@ -480,8 +513,12 @@ function renderView(monthly,yearly,m){
     title.textContent="Prognose "+cur+" \u2013 "+m.label;
     var fc=computeForecast(monthly,yearly);
     if(!fc){area.innerHTML='<p style="color:#94a3b8;padding:16px">Nicht genug Daten.</p>';return;}
+    var partialNote="";
+    if(fc.lastActualMonth===fc.currentMonth&&fc.monthFraction<1){
+      partialNote=' &bull; Monat '+fc.lastActualMonth+' zu '+Math.round(fc.monthFraction*100)+'% hochgerechnet';
+    }
     area.innerHTML=
-      '<div class="info-box">Basis: '+fc.refYears.join(", ")+" &bull; Gew. Jahresdurchschnitt: <b>"+fc.avgAnnual.toLocaleString("de")+" "+m.unit+"</b></div>"+
+      '<div class="info-box">Basis: '+fc.refYears.join(", ")+" &bull; Gew. Jahresdurchschnitt: <b>"+fc.avgAnnual.toLocaleString("de")+" "+m.unit+"</b>"+partialNote+"</div>"+
       '<div class="fc-grid">'+
         '<div class="fc" style="border-top-color:#10b981"><div class="fc-label">Ist bis Monat '+fc.lastActualMonth+'</div><div class="fc-val" style="color:#10b981">'+fc.actualSoFar.toLocaleString("de")+" "+m.unit+"</div></div>"+
         '<div class="fc" style="border-top-color:'+m.color+'"><div class="fc-label">\u00d8 Jahresverbrauch</div><div class="fc-val" style="color:'+m.color+'">'+fc.avgAnnual.toLocaleString("de")+" "+m.unit+"</div></div>"+
@@ -493,37 +530,47 @@ function renderView(monthly,yearly,m){
   }
 
   var data=[],series=[];
-  if(currentView==="monthly"){
-    title.textContent="Monatlicher Verbrauch \u2013 letzte 24 Monate";
-    monthly.slice(-24).forEach(function(x){data.push({label:x.label,v:x.value});});
-    series=[{key:"v",name:"Verbrauch",color:m.color}];
-  } else if(currentView==="seasonal"){
-    title.textContent="Saisonaler Vergleich";
+  if(currentView==="seasonal"){
+    title.textContent="Saisonaler Vergleich \u2013 "+String(cur-2)+", "+String(cur-1)+", "+String(cur);
     var smap={};
     monthly.forEach(function(x){if(!smap[x.month])smap[x.month]=[];smap[x.month].push(x);});
     for(var mi=0;mi<12;mi++){
       var mo=mi+1,items=smap[mo]||[],s2=0;
       items.forEach(function(x){s2+=x.value;});
-      var avg=items.length?Math.round(s2/items.length*10)/10:0,vP=null,vC=null;
-      items.forEach(function(x){if(x.year===cur-1)vP=x.value;if(x.year===cur)vC=x.value;});
-      data.push({label:MONTHS[mi],avg:avg,vP:vP,vC:vC});
+      var avg=items.length?Math.round(s2/items.length*10)/10:0;
+      var vP2=null,vP=null,vC=null;
+      items.forEach(function(x){
+        if(x.year===cur-2)vP2=x.value;
+        if(x.year===cur-1)vP=x.value;
+        if(x.year===cur)vC=x.value;
+      });
+      data.push({label:MONTHS[mi],avg:avg,vP2:vP2,vP:vP,vC:vC});
     }
-    series=[{key:"avg",name:"Durchschnitt",color:"#94a3b8"},{key:"vP",name:String(cur-1),color:m.color},{key:"vC",name:String(cur),color:"#10b981"}];
+    series=[
+      {key:"avg",name:"Durchschnitt",color:"#cbd5e1"},
+      {key:"vP2",name:String(cur-2),color:"#94a3b8"},
+      {key:"vP",name:String(cur-1),color:m.color},
+      {key:"vC",name:String(cur),color:"#10b981"}
+    ];
   } else if(currentView==="yearly"){
     title.textContent="J\u00e4hrlicher Gesamtverbrauch";
-    yearly.filter(function(y){return y.year>=2019&&y.year<cur;}).forEach(function(y){data.push({label:y.label,v:y.value});});
+    var filteredYearly=yearly.filter(function(y){return y.year>=2019&&y.year<cur;});
+    filteredYearly.forEach(function(y){data.push({label:y.label,v:y.value});});
     series=[{key:"v",name:"Jahresverbrauch",color:m.color}];
   }
-  drawChart(area,data,series,m.unit);
+  drawChart(area,data,series,m.unit,currentView==="yearly");
 }
 
 // ---- SVG Chart ----
-function drawChart(container,data,series,unit){
+function drawChart(container,data,series,unit,showValueLabels){
   var W=Math.max(container.clientWidth||0,340),H=270;
-  var pad={top:18,right:18,bottom:52,left:56};
+  var pad={top:28,right:18,bottom:52,left:56};
+  if(showValueLabels) pad.top=38; // extra space for value labels on top
   var cw=W-pad.left-pad.right,ch=H-pad.top-pad.bottom;
   var n=data.length,s=series.length,maxV=0.001;
   data.forEach(function(d){series.forEach(function(se){var v=d[se.key];if(v&&v>maxV)maxV=v;});});
+  // For yearly with value labels, add 10% headroom
+  if(showValueLabels) maxV=maxV*1.12;
   var barW=Math.min(32,Math.max(3,(cw/n)*0.75/s)),gW=barW*s+(s-1)*2;
   var svg='<svg width="100%" height="'+H+'" viewBox="0 0 '+W+' '+H+'" xmlns="http://www.w3.org/2000/svg">';
   for(var gi=0;gi<=4;gi++){
@@ -537,6 +584,11 @@ function drawChart(container,data,series,unit){
       var bv=d[se.key];if(!bv||bv<=0)return;
       var bh=Math.max(2,(bv/maxV)*ch),bx=xc-gW/2+si*(barW+2),by=pad.top+ch-bh;
       svg+='<rect x="'+bx+'" y="'+by+'" width="'+barW+'" height="'+bh+'" fill="'+se.color+'" rx="3"><title>'+se.name+': '+bv.toLocaleString("de")+" "+(unit||"")+'</title></rect>';
+      // Show value label on top of bar for yearly view (single series)
+      if(showValueLabels&&s===1){
+        var labelVal=Math.round(bv).toLocaleString("de");
+        svg+='<text x="'+(bx+barW/2)+'" y="'+(by-4)+'" text-anchor="middle" font-size="10" font-weight="600" fill="#374151">'+labelVal+'</text>';
+      }
     });
     var lbl=String(d.label);if(n>14&&lbl.length>7)lbl=lbl.substring(0,7);
     var tx=xc,ty=pad.top+ch+14,rot=n>10?' transform="rotate(-40,'+tx+','+ty+')"':'';
@@ -570,7 +622,7 @@ function selectMeter(m){
 
 function showView(v){
   currentView=v;
-  ["monthly","seasonal","yearly","forecast","table"].forEach(function(x){
+  ["seasonal","yearly","forecast","table"].forEach(function(x){
     var el=document.getElementById("tab-"+x);
     if(el) el.className="tab"+(x===v?" active":"");
   });
