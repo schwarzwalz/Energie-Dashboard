@@ -399,59 +399,72 @@ function getYearly(monthly){
 function computeForecast(monthly,yearly){
   var now=new Date();
   var cur=now.getFullYear();
-  var curMonth=now.getMonth()+1; // 1-12, current month (may be partial)
-  var comp=yearly.filter(function(y){return y.year<cur&&y.value>0;}).slice(-5);
-  if(!comp.length) return null;
-  var totalW=0,wAnn=0,wShare=[0,0,0,0,0,0,0,0,0,0,0,0];
-  comp.forEach(function(y,i){
-    var w=i+1; totalW+=w; wAnn+=y.value*w;
-    monthly.filter(function(m){return m.year===y.year;}).forEach(function(m){
-      wShare[m.month-1]+=(m.value/y.value)*w;
-    });
-  });
-  var avgAnn=wAnn/totalW, sSum=0;
-  wShare=wShare.map(function(s){var v=s/totalW;sSum+=v;return v;});
-  wShare=wShare.map(function(s){return sSum>0?s/sSum:1/12;});
+  var curMonth=now.getMonth()+1; // 1-12
+  var daysInCurMonth=new Date(cur,curMonth,0).getDate();
+  var dayOfMonth=now.getDate();
+  var monthFraction=dayOfMonth/daysInCurMonth;
 
-  // Find actual data for current year
+  // Use last 3 complete years as reference
+  var refYears=yearly
+    .filter(function(y){return y.year<cur&&y.value>100;}) // skip near-empty years
+    .slice(-3)
+    .map(function(y){return y.year;});
+  if(!refYears.length) return null;
+
+  // Build per-month averages from reference years (direct absolute values, not relative shares)
+  // For each calendar month, average the actual consumption across reference years
+  var monthAvg=[]; // index 0=Jan .. 11=Dez
+  for(var mi=0;mi<12;mi++){
+    var mo=mi+1, vals=[];
+    refYears.forEach(function(ry){
+      var found=monthly.filter(function(m){return m.year===ry&&m.month===mo;});
+      if(found.length) vals.push(found[0].value);
+    });
+    monthAvg[mi]=vals.length ? vals.reduce(function(a,b){return a+b;},0)/vals.length : 0;
+  }
+
+  // Derive avgAnnual from the per-month averages (sum of all 12 month averages)
+  var avgAnn=monthAvg.reduce(function(a,b){return a+b;},0);
+
+  // Actual data for current year
   var actMap={},lastMo=0;
   monthly.filter(function(m){return m.year===cur;}).forEach(function(m){
     actMap[m.month]=m.value; if(m.month>lastMo) lastMo=m.month;
   });
 
-  // Calculate how far through the current month we are (for partial month extrapolation)
-  var daysInCurMonth=new Date(cur,curMonth,0).getDate();
-  var dayOfMonth=now.getDate();
-  var monthFraction=dayOfMonth/daysInCurMonth;
-
+  // Sum of completed actual months (months before lastMo are always complete)
   var actTotal=0;
-  for(var mo=1;mo<=lastMo;mo++) actTotal+=(actMap[mo]||0);
+  for(var mo2=1;mo2<=lastMo;mo2++) actTotal+=(actMap[mo2]||0);
 
-  // If current month has actual data (lastMo === curMonth), extrapolate it to full month
+  // For projection: if lastMo == curMonth, the reading may be mid-month.
+  // Extrapolate that month to full month using per-month average as a shape reference.
+  // We scale by (historical full month / historical partial month) = 1/monthFraction
+  // but cap at 3× to avoid wild extrapolations early in month
   var actTotalForProj=actTotal;
-  if(lastMo===curMonth && actMap[curMonth] && monthFraction>0 && monthFraction<1){
-    // Replace partial month value with extrapolated full month value
+  if(lastMo===curMonth && actMap[curMonth] && monthFraction>0 && monthFraction<0.98){
     var partialVal=actMap[curMonth];
-    var extrapolatedVal=partialVal/monthFraction;
-    actTotalForProj=actTotal-partialVal+extrapolatedVal;
+    var scaleFactor=Math.min(1/monthFraction, 3);
+    var extrapolated=partialVal*scaleFactor;
+    actTotalForProj=actTotal-partialVal+extrapolated;
   }
 
-  // Project remaining months after lastMo
+  // Add forecast for remaining months using direct per-month averages
   var proj=actTotalForProj;
-  for(var pm=lastMo+1;pm<=12;pm++) proj+=avgAnn*wShare[pm-1];
+  for(var pm=lastMo+1;pm<=12;pm++) proj+=monthAvg[pm-1];
 
+  // Build display months array
   var months=[];
   for(var fm=0;fm<12;fm++){
-    var mo2=fm+1,isAct=mo2<=lastMo;
-    var isPartial=(mo2===curMonth&&mo2===lastMo&&monthFraction<1);
-    var dispVal;
-    if(isAct){
-      dispVal=actMap[mo2]||0;
-    } else {
-      dispVal=Math.round(avgAnn*wShare[fm]*10)/10;
-    }
-    months.push({month:MONTHS[fm],value:dispVal,isActual:isAct,isPartial:isPartial});
+    var mo3=fm+1, isAct=mo3<=lastMo;
+    var isPartial=(mo3===curMonth&&mo3===lastMo&&monthFraction<0.98);
+    months.push({
+      month:MONTHS[fm],
+      value:isAct?(actMap[mo3]||0):Math.round(monthAvg[fm]*10)/10,
+      isActual:isAct,
+      isPartial:isPartial
+    });
   }
+
   return {
     months:months,
     projected:Math.round(proj),
@@ -460,7 +473,7 @@ function computeForecast(monthly,yearly){
     lastActualMonth:lastMo,
     currentMonth:curMonth,
     monthFraction:monthFraction,
-    refYears:comp.map(function(y){return y.year;})
+    refYears:refYears
   };
 }
 
