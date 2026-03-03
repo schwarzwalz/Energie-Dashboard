@@ -56,6 +56,7 @@ h1{font-size:1.3rem;margin-bottom:2px}
 .status.ok{background:#f0fdf4;color:#166534;border:1px solid #86efac;display:block}
 .status.err{background:#fef2f2;color:#991b1b;border:1px solid #fecaca;display:block}
 .status.loading{background:#eff6ff;color:#1e40af;border:1px solid #bfdbfe;display:block}
+/* Token setup screen */
 #setup-screen{background:#fff;border-radius:14px;padding:24px;box-shadow:0 1px 4px rgba(0,0,0,.1);margin-bottom:16px;display:none}
 #setup-screen h2{font-size:1rem;margin-bottom:8px}
 #setup-screen p{font-size:12px;color:#64748b;margin-bottom:12px;line-height:1.6}
@@ -63,6 +64,8 @@ h1{font-size:1.3rem;margin-bottom:2px}
 </head>
 <body>
 <div class="wrap">
+
+  <!-- Token Setup (shown if no token saved) -->
 
   <div id="setup-screen">
     <h2>&#128274; GitHub Token einrichten</h2>
@@ -202,39 +205,63 @@ function ghHeaders(){
 
 function loadData(){
   setStatus("loading","Daten werden geladen...");
-  fetch(API+"?ref="+BRANCH,{headers:ghHeaders()})
+  var rawURL="https://raw.githubusercontent.com/"+OWNER+"/"+REPO+"/"+BRANCH+"/"+FILE+"?t="+Date.now();
+  fetch(rawURL,{cache:"no-store", headers:{"Accept":"text/plain, application/json, */*"}})
     .then(function(r){
-      if(r.status===404){setStatus("err","data.json nicht gefunden. Bitte zuerst in GitHub hochladen.");return null;}
-      if(r.status===401){setStatus("err","Token ung\u00fcltig oder abgelaufen.");return null;}
       if(!r.ok){setStatus("err","Ladefehler HTTP "+r.status);return null;}
-      return r.json();
+      return r.text();
     })
-    .then(function(j){
-      if(!j) return;
-      fileSHA=j.sha;
-      var b64=j.content.replace(/\n/g,"");
-      var binary=atob(b64);
-      var bytes=new Uint8Array(binary.length);
-      for(var i=0;i<binary.length;i++) bytes[i]=binary.charCodeAt(i);
-      var text=new TextDecoder("utf-8").decode(bytes);
+    .then(function(text){
+      if(text===null||text===undefined) return;
+      if(!text||text.trim()===""){setStatus("err","data.json ist leer");return;}
+      // Strip any BOM, HTML wrapper or invisible chars
       text=text.trim();
-      var start=text.indexOf("{"), end=text.lastIndexOf("}");
-      if(start<0||end<0){setStatus("err","Kein JSON gefunden.");return;}
+      var start=text.indexOf("{");
+      var end=text.lastIndexOf("}");
+      if(start<0||end<0){setStatus("err","Kein JSON gefunden. Inhalt beginnt mit: "+text.substring(0,80));return;}
       text=text.substring(start,end+1);
       var json;
-      try{ json=JSON.parse(text); }
-      catch(e){ setStatus("err","JSON Fehler: "+e.message); return; }
-      if(!json.gas||!json.strom||!json.wasser){setStatus("err","Datenstruktur ung\u00fcltig.");return;}
+      try{
+        json=JSON.parse(text);
+      } catch(e){
+        setStatus("err","JSON Parse Fehler: "+e.message+" | Zeichen "+findBadChar(text));
+        return;
+      }
+      if(!json.gas||!json.strom||!json.wasser){
+        setStatus("err","Datenstruktur ungueltig. Felder: "+Object.keys(json).join(", "));
+        return;
+      }
       DATA=json;
+      fetchSHA();
       setStatus("ok","Daten geladen \u2013 "+countEntries()+" Eintr\u00e4ge");
       setTimeout(function(){clearStatus();},3000);
       render();
     })
-    .catch(function(e){setStatus("err","Ladefehler: "+e.message);});
+    .catch(function(e){
+      setStatus("err","Fetch Fehler: "+e.name+" \u2013 "+e.message);
+    });
+}
+
+function fetchSHA(){
+  fetch(API+"?ref="+BRANCH,{headers:ghHeaders()})
+    .then(function(r){ return r.ok ? r.json() : null; })
+    .then(function(j){ if(j&&j.sha) fileSHA=j.sha; })
+    .catch(function(){});
+}
+
+function findBadChar(text){
+  for(var i=0;i<text.length;i++){
+    var c=text.charCodeAt(i);
+    if(c===0x201C||c===0x201D||c===0x2018||c===0x2019||c===0xFEFF||c===0x200B){
+      return "Position "+i+", char code "+c+", Kontext: "+text.substring(Math.max(0,i-20),i+20);
+    }
+  }
+  return "Unbekannt";
 }
 
 function saveData(cb){
   setStatus("loading","Wird in GitHub gespeichert...");
+  // If we don't have SHA yet, fetch it first
   if(!fileSHA){
     fetch(API+"?ref="+BRANCH,{headers:ghHeaders()})
       .then(function(r){ return r.ok?r.json():null; })
